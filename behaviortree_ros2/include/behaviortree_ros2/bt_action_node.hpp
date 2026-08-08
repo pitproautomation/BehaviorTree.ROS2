@@ -395,6 +395,10 @@ inline NodeStatus RosActionNode<T>::tick()
 
     goal_received_ = false;
     future_goal_handle_ = {};
+    // The handle belongs to the previous goal; the client library forgets
+    // it once that goal's result is delivered, so carrying it into a new
+    // goal makes a later cancelGoal() throw UnknownGoalHandleError.
+    goal_handle_ = {};
     on_feedback_state_change_ = NodeStatus::RUNNING;
     result_ = {};
 
@@ -420,7 +424,7 @@ inline NodeStatus RosActionNode<T>::tick()
         };
     //--------------------
     goal_options.result_callback = [this](const WrappedResult& result) {
-      if(goal_handle_->get_goal_id() == result.goal_id)
+      if(goal_handle_ && goal_handle_->get_goal_id() == result.goal_id)
       {
         RCLCPP_DEBUG(logger(), "result_callback");
         result_ = result;
@@ -559,22 +563,34 @@ inline void RosActionNode<T>::cancelGoal()
 
   auto& action_client = client_instance_->action_client;
 
-  auto future_result = action_client->async_get_result(goal_handle_);
-  auto future_cancel = action_client->async_cancel_goal(goal_handle_);
-
-  constexpr auto SUCCESS = rclcpp::FutureReturnCode::SUCCESS;
-
-  if(executor.spin_until_future_complete(future_cancel, server_timeout_) != SUCCESS)
+  try
   {
-    RCLCPP_ERROR(logger(), "Failed to cancel action server for [%s]",
-                 action_name_.c_str());
-  }
+    auto future_result = action_client->async_get_result(goal_handle_);
+    auto future_cancel = action_client->async_cancel_goal(goal_handle_);
 
-  if(executor.spin_until_future_complete(future_result, server_timeout_) != SUCCESS)
-  {
-    RCLCPP_ERROR(logger(), "Failed to get result call failed :( for [%s]",
-                 action_name_.c_str());
+    constexpr auto SUCCESS = rclcpp::FutureReturnCode::SUCCESS;
+
+    if(executor.spin_until_future_complete(future_cancel, server_timeout_) != SUCCESS)
+    {
+      RCLCPP_ERROR(logger(), "Failed to cancel action server for [%s]",
+                   action_name_.c_str());
+    }
+
+    if(executor.spin_until_future_complete(future_result, server_timeout_) != SUCCESS)
+    {
+      RCLCPP_ERROR(logger(), "Failed to get result call failed :( for [%s]",
+                   action_name_.c_str());
+    }
   }
+  catch(const rclcpp_action::exceptions::UnknownGoalHandleError&)
+  {
+    // The client no longer tracks this goal (result already delivered or
+    // the goal expired server-side): there is nothing left to cancel, and
+    // throwing out of a halt would take down the whole tree's process.
+    RCLCPP_WARN(logger(), "cancelGoal on a goal [%s] no longer tracks; nothing to cancel",
+                action_name_.c_str());
+  }
+  goal_handle_ = {};
 }
 
 }  // namespace BT
