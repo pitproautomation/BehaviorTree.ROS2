@@ -432,13 +432,17 @@ inline NodeStatus RosActionNode<T>::tick()
       }
     };
     //--------------------
+    // Report only. A rejection is acted on by tick(), which reads the empty
+    // handle off the future and calls onFailure once. Returning onFailure's
+    // status from here made the lambda non-void, and the accepted branch then
+    // fell off the end of a non-void function: undefined behavior, harmless
+    // unoptimized, a crash or a spin at -O2 on every accepted goal.
     goal_options.goal_response_callback =
         [this](typename GoalHandle::SharedPtr const future_handle) {
           auto goal_handle_ = future_handle.get();
           if(!goal_handle_)
           {
             RCLCPP_ERROR(logger(), "Goal was rejected by server");
-            return onFailure(GOAL_REJECTED_BY_SERVER);
           }
           else
           {
