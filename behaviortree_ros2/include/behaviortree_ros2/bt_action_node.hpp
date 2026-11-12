@@ -589,7 +589,12 @@ inline void RosActionNode<T>::halt()
 {
   if(status() == BT::NodeStatus::RUNNING)
   {
-    cancelGoal();
+    {
+      // The cancel spins the executor every node on this action shares; spun
+      // while another node's tick spins it, the executor throws.
+      std::unique_lock<std::mutex> lock(getMutex());
+      cancelGoal();
+    }
     onHalt();
   }
 }
