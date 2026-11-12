@@ -491,7 +491,13 @@ inline NodeStatus RosActionNode<T>::tick()
       return onFailure(SERVER_UNREACHABLE, {});
     }
 
-    future_goal_handle_ = action_client->async_send_goal(goal, goal_options);
+    {
+      // The client is shared by every node on this action, and it draws each
+      // goal's id from a generator with no lock of its own: two trees sending
+      // at once can draw the same id, and a server that accepts both throws.
+      std::unique_lock<std::mutex> lock(getMutex());
+      future_goal_handle_ = action_client->async_send_goal(goal, goal_options);
+    }
     time_goal_sent_ = now();
 
     return NodeStatus::RUNNING;
