@@ -16,6 +16,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <optional>
 #include <vector>
@@ -99,7 +100,13 @@ public:
   explicit RosActionNode(const std::string& instance_name, const BT::NodeConfig& conf,
                          const RosNodeParams& params);
 
-  virtual ~RosActionNode() = default;
+  virtual ~RosActionNode()
+  {
+    // Waits out a callback another node's spin is running on this node, and
+    // turns away the ones that come later.
+    std::unique_lock<std::mutex> lock(liveness_->mutex);
+    liveness_->alive = false;
+  }
 
   /**
    * @brief Any subclass of RosActionNode that has ports must implement a
@@ -254,6 +261,17 @@ private:
   // Takes the early result that belongs to goal_handle_, if one came, and
   // reports and discards the rest.
   void claimEarlyResult();
+
+  // The shared client keeps a goal's callbacks for as long as the goal lives,
+  // which can be longer than the node that sent it: a cancel that timed out
+  // leaves a goal whose result another node's spin delivers after this node
+  // is gone. Each callback holds this and runs only while the node is alive.
+  struct Liveness
+  {
+    std::mutex mutex;
+    bool alive = true;
+  };
+  const std::shared_ptr<Liveness> liveness_ = std::make_shared<Liveness>();
 
   bool createClient(const std::string& action_name);
 };
@@ -430,8 +448,13 @@ inline NodeStatus RosActionNode<T>::tick()
 
     //--------------------
     goal_options.feedback_callback =
-        [this](typename GoalHandle::SharedPtr,
-               const std::shared_ptr<const Feedback> feedback) {
+        [this, liveness = liveness_](typename GoalHandle::SharedPtr,
+                                     const std::shared_ptr<const Feedback> feedback) {
+          std::unique_lock<std::mutex> alive_lock(liveness->mutex);
+          if(!liveness->alive)
+          {
+            return;
+          }
           on_feedback_state_change_ = onFeedback(feedback);
           if(on_feedback_state_change_ == NodeStatus::IDLE)
           {
@@ -440,7 +463,13 @@ inline NodeStatus RosActionNode<T>::tick()
           emitWakeUpSignal();
         };
     //--------------------
-    goal_options.result_callback = [this](const WrappedResult& result) {
+    goal_options.result_callback = [this,
+                                    liveness = liveness_](const WrappedResult& result) {
+      std::unique_lock<std::mutex> alive_lock(liveness->mutex);
+      if(!liveness->alive)
+      {
+        return;
+      }
       if(goal_handle_ && goal_handle_->get_goal_id() == result.goal_id)
       {
         RCLCPP_DEBUG(logger(), "result_callback");
@@ -473,7 +502,12 @@ inline NodeStatus RosActionNode<T>::tick()
     // fell off the end of a non-void function: undefined behavior, harmless
     // unoptimized, a crash or a spin at -O2 on every accepted goal.
     goal_options.goal_response_callback =
-        [this](typename GoalHandle::SharedPtr const future_handle) {
+        [this, liveness = liveness_](typename GoalHandle::SharedPtr const future_handle) {
+          std::unique_lock<std::mutex> alive_lock(liveness->mutex);
+          if(!liveness->alive)
+          {
+            return;
+          }
           auto goal_handle_ = future_handle.get();
           if(!goal_handle_)
           {
