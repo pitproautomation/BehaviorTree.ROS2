@@ -18,6 +18,7 @@
 #include <memory>
 #include <string>
 #include <optional>
+#include <vector>
 #include <rclcpp/executors.hpp>
 #include <rclcpp/allocator/allocator_common.hpp>
 #include "behaviortree_cpp/action_node.h"
@@ -243,6 +244,16 @@ private:
   NodeStatus on_feedback_state_change_;
   bool goal_received_;
   WrappedResult result_;
+  // Results that arrived before this node read its goal handle off the
+  // future. The client and its executor are shared by every node on the same
+  // action, so another node's spin can deliver this goal's response and then
+  // its result while this node is between ticks; the goal id settles which,
+  // if any, belongs to the goal this node is waiting on.
+  std::vector<WrappedResult> early_results_;
+
+  // Takes the early result that belongs to goal_handle_, if one came, and
+  // reports and discards the rest.
+  void claimEarlyResult();
 
   bool createClient(const std::string& action_name);
 };
@@ -393,14 +404,20 @@ inline NodeStatus RosActionNode<T>::tick()
   {
     setStatus(NodeStatus::RUNNING);
 
-    goal_received_ = false;
-    future_goal_handle_ = {};
-    // The handle belongs to the previous goal; the client library forgets
-    // it once that goal's result is delivered, so carrying it into a new
-    // goal makes a later cancelGoal() throw UnknownGoalHandleError.
-    goal_handle_ = {};
-    on_feedback_state_change_ = NodeStatus::RUNNING;
-    result_ = {};
+    {
+      // Another node's spin may still deliver a late callback of this node's
+      // previous goal, and those callbacks write this state.
+      std::unique_lock<std::mutex> lock(getMutex());
+      goal_received_ = false;
+      future_goal_handle_ = {};
+      // The handle belongs to the previous goal; the client library forgets
+      // it once that goal's result is delivered, so carrying it into a new
+      // goal makes a later cancelGoal() throw UnknownGoalHandleError.
+      goal_handle_ = {};
+      on_feedback_state_change_ = NodeStatus::RUNNING;
+      result_ = {};
+      early_results_.clear();
+    }
 
     Goal goal;
 
@@ -429,6 +446,24 @@ inline NodeStatus RosActionNode<T>::tick()
         RCLCPP_DEBUG(logger(), "result_callback");
         result_ = result;
         emitWakeUpSignal();
+      }
+      else if(!goal_handle_)
+      {
+        // Delivered by another node's spin before this node's own tick read
+        // the goal handle. Kept until it has, and the tree woken to read it.
+        RCLCPP_DEBUG(logger(), "%s: result for goal %s arrived before its goal handle",
+                     name().c_str(), rclcpp_action::to_string(result.goal_id).c_str());
+        early_results_.push_back(result);
+        emitWakeUpSignal();
+      }
+      else
+      {
+        RCLCPP_WARN(logger(),
+                    "%s: dropped a result for goal %s on [%s]; this node waits on goal "
+                    "%s",
+                    name().c_str(), rclcpp_action::to_string(result.goal_id).c_str(),
+                    action_name_.c_str(),
+                    rclcpp_action::to_string(goal_handle_->get_goal_id()).c_str());
       }
     };
     //--------------------
@@ -497,6 +532,7 @@ inline NodeStatus RosActionNode<T>::tick()
         {
           return CheckStatus(onFailure(GOAL_REJECTED_BY_SERVER));
         }
+        claimEarlyResult();
       }
     }
 
@@ -524,6 +560,28 @@ inline NodeStatus RosActionNode<T>::tick()
     }
   }
   return NodeStatus::RUNNING;
+}
+
+template <class T>
+inline void RosActionNode<T>::claimEarlyResult()
+{
+  for(const auto& early : early_results_)
+  {
+    if(early.goal_id == goal_handle_->get_goal_id())
+    {
+      result_ = early;
+    }
+    else
+    {
+      RCLCPP_WARN(logger(),
+                  "%s: dropped an early result for goal %s on [%s]; this node waits on "
+                  "goal %s",
+                  name().c_str(), rclcpp_action::to_string(early.goal_id).c_str(),
+                  action_name_.c_str(),
+                  rclcpp_action::to_string(goal_handle_->get_goal_id()).c_str());
+    }
+  }
+  early_results_.clear();
 }
 
 template <class T>
