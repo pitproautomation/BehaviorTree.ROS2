@@ -619,6 +619,12 @@ inline void RosActionNode<T>::cancelGoal()
       {
         goal_handle_ = future_goal_handle_.get();
         future_goal_handle_ = {};
+        if(!goal_handle_)
+        {
+          // The server turned the goal down: there is nothing to cancel, and
+          // the client library dereferences the handle it is given.
+          return;
+        }
       }
     }
     else
